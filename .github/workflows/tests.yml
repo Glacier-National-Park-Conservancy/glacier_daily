@@ -93,7 +93,7 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          slug: amerorchis/glacier_daily
+          slug: Glacier-National-Park-Conservancy/glacier_daily
 
   # Runs on the production Raspberry Pi, which holds decrypted secrets and sits
   # on the tailnet. `uv sync` and pytest both execute code from the PR head, so
