@@ -155,6 +155,29 @@ class TestSelectVideo:
         assert video_url == "https://glacier.org/webcam-timelapse/?type=daily&id=latest"
         assert descriptor == "Latest"
 
+    @patch("sunrise_timelapse.get_timelapse.logger")
+    @patch(
+        "sunrise_timelapse.get_timelapse.now_mountain",
+        return_value=datetime(2025, 8, 21),
+    )
+    def test_select_latest_video_logs_fallback(self, mock_now, mock_logger):
+        """Falling back to the latest video is logged with today's missing id."""
+        select_video(MOCK_TIMELAPSE_DATA)
+
+        args = mock_logger.info.call_args.args
+        assert "using latest" in args[0]
+        assert args[1] == "8_21_2025_sunrise_timelapse"
+
+    @patch("sunrise_timelapse.get_timelapse.logger")
+    @patch(
+        "sunrise_timelapse.get_timelapse.now_mountain",
+        return_value=datetime(2025, 8, 20),
+    )
+    def test_select_today_video_does_not_log_fallback(self, mock_now, mock_logger):
+        select_video(MOCK_TIMELAPSE_DATA)
+
+        mock_logger.info.assert_not_called()
+
     def test_select_video_empty_data(self):
         """Test handling empty data."""
         result = select_video({})
