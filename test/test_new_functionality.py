@@ -254,6 +254,7 @@ class TestSleepToSunriseMaxTimeout:
         import sunrise_timelapse.sleep_to_sunrise as sts
 
         monkeypatch.setattr(sts, "sunrise_timelapse_complete_time", lambda: 100)
+        monkeypatch.setattr(sts, "todays_video_published", lambda: True)
         slept = {}
         monkeypatch.setattr(sts, "sleep", lambda t: slept.setdefault("time", t))
 
