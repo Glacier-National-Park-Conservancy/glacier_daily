@@ -92,12 +92,20 @@ def select_video(
         for entry in video_entries:
             if entry.get("id") == "latest":
                 id_ = entry.get("vid_src").split("/")[-1].rsplit("_", 2)[0]
+                logger.info(
+                    "No sunrise video for today (%s); using latest (%s)", today_id, id_
+                )
                 return id_, entry.get("url"), "Latest"
 
         # If no latest found, return the first sunrise entry
         # (the feed also carries sunset entries)
         for entry in video_entries:
             if "sunrise" in entry.get("id", ""):
+                logger.info(
+                    "No sunrise video for today (%s) and no latest entry; using %s",
+                    today_id,
+                    entry.get("id"),
+                )
                 return entry.get("id"), entry.get("url"), "Latest"
 
         return None, None, None
