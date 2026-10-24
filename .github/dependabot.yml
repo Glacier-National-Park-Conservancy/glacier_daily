@@ -1,0 +1,24 @@
+# Security updates are grouped into one PR per ecosystem so lockfile bumps don't conflict.
+# open-pull-requests-limit: 0 turns off routine version updates; security updates still run.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - '*'
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - '*'
