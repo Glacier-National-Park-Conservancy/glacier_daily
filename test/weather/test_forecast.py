@@ -2,9 +2,14 @@ import json
 from unittest.mock import Mock, mock_open, patch
 
 import pytest
+import urllib3
+from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
 
+from weather import forecast
 from weather.forecast import (
+    API_HOST,
+    DOH_LOOKUPS,
     READ_RETRIES,
     REQUEST_TIMEOUT,
     Location,
@@ -165,6 +170,142 @@ class TestGetForecast:
 
         with pytest.raises(json.JSONDecodeError):
             get_forecast()
+
+
+@patch("requests_cache.CachedSession")
+class TestFallbackServer:
+    """get_forecast tries another Open-Meteo server when ours stalls."""
+
+    @pytest.fixture(autouse=True)
+    def one_location(self):
+        with patch.object(
+            WeatherAPI, "_load_locations", return_value=[SAMPLE_LOCATION]
+        ):
+            yield
+
+    def test_uses_other_server_after_connection_error(
+        self, mock_session, mock_weather_codes_file
+    ):
+        mock_session.return_value.get.side_effect = RequestsConnectionError("stall")
+        with (
+            patch.object(forecast, "_system_ips", return_value={"1.1.1.1"}),
+            patch.object(
+                forecast, "_doh_lookup", side_effect=[["1.1.1.1"], ["2.2.2.2"]]
+            ) as lookup,
+            patch.object(
+                forecast, "_fetch_from_ip", return_value=[MOCK_API_RESPONSE]
+            ) as fetch,
+        ):
+            results, length_str = get_forecast()
+
+        assert results == [("Test Location", 75, 36, "sunny")]
+        assert "sunrise" in length_str
+        assert lookup.call_count == 2  # stops once another server turns up
+        assert fetch.call_args.args[0] == "2.2.2.2"
+
+    def test_raises_when_no_other_server_found(self, mock_session):
+        mock_session.return_value.get.side_effect = RequestsConnectionError("stall")
+        with (
+            patch.object(forecast, "_system_ips", return_value={"1.1.1.1"}),
+            patch.object(forecast, "_doh_lookup", return_value=["1.1.1.1"]) as lookup,
+            patch.object(forecast, "_fetch_from_ip") as fetch,
+            pytest.raises(RequestException, match=r"No api\.open-meteo\.com servers"),
+        ):
+            get_forecast()
+        assert lookup.call_count == DOH_LOOKUPS
+        fetch.assert_not_called()
+
+    def test_raises_when_fallback_servers_fail(self, mock_session):
+        mock_session.return_value.get.side_effect = RequestsConnectionError("stall")
+        with (
+            patch.object(forecast, "_system_ips", return_value=set()),
+            patch.object(forecast, "_doh_lookup", return_value=["2.2.2.2", "3.3.3.3"]),
+            patch.object(
+                forecast, "_fetch_from_ip", side_effect=RequestException("down")
+            ) as fetch,
+            pytest.raises(RequestException, match="Fallback servers failed"),
+        ):
+            get_forecast()
+        assert fetch.call_count == 2
+
+    def test_raises_when_doh_lookups_all_fail(self, mock_session):
+        mock_session.return_value.get.side_effect = RequestsConnectionError("stall")
+        with (
+            patch.object(forecast, "_system_ips", return_value=set()),
+            patch.object(
+                forecast, "_doh_lookup", side_effect=RequestException("no dns")
+            ),
+            pytest.raises(RequestException, match="DNS-over-HTTPS lookup failed"),
+        ):
+            get_forecast()
+
+    def test_http_error_does_not_use_fallback(self, mock_session):
+        """A server that answers with an error isn't stalled; don't go around it."""
+        response = Mock()
+        response.raise_for_status.side_effect = RequestException("503")
+        mock_session.return_value.get.return_value = response
+        with (
+            patch.object(forecast, "_doh_lookup") as lookup,
+            pytest.raises(RequestException, match="503"),
+        ):
+            get_forecast()
+        lookup.assert_not_called()
+
+
+class TestFetchFromIp:
+    @pytest.fixture
+    def pool(self):
+        with patch.object(urllib3, "HTTPSConnectionPool") as pool_cls:
+            yield pool_cls
+
+    def test_verifies_tls_against_api_host(self, pool):
+        pool.return_value.request.return_value = Mock(
+            status=200, data=json.dumps([MOCK_API_RESPONSE]).encode()
+        )
+        result = forecast._fetch_from_ip("2.2.2.2", {"latitude": [1, 2]})
+
+        assert result == [MOCK_API_RESPONSE]
+        args, kwargs = pool.call_args
+        assert args[0] == "2.2.2.2"
+        assert kwargs["server_hostname"] == API_HOST
+        assert kwargs["assert_hostname"] == API_HOST
+        assert kwargs["cert_reqs"] == "CERT_REQUIRED"
+        _, url = pool.return_value.request.call_args.args
+        assert url == "/v1/forecast?latitude=1&latitude=2"
+        assert pool.return_value.request.call_args.kwargs["headers"] == {
+            "Host": API_HOST
+        }
+        pool.return_value.close.assert_called_once()
+
+    def test_non_200_raises(self, pool):
+        pool.return_value.request.return_value = Mock(status=503, data=b"")
+        with pytest.raises(RequestException, match="HTTP 503"):
+            forecast._fetch_from_ip("2.2.2.2", {})
+
+    def test_urllib3_error_raises_request_exception(self, pool):
+        pool.return_value.request.side_effect = urllib3.exceptions.ReadTimeoutError(
+            None, "/", "timed out"
+        )
+        with pytest.raises(RequestException, match=r"2\.2\.2\.2"):
+            forecast._fetch_from_ip("2.2.2.2", {})
+
+
+def test_doh_lookup_returns_a_records():
+    response = Mock()
+    response.json.return_value = {
+        "Answer": [
+            {"type": 5, "data": "alias.example."},
+            {"type": 1, "data": "2.2.2.2"},
+        ]
+    }
+    with patch.object(forecast.requests, "get", return_value=response) as get:
+        assert forecast._doh_lookup(API_HOST) == ["2.2.2.2"]
+    assert get.call_args.kwargs["params"] == {"name": API_HOST, "type": "A"}
+
+
+def test_system_ips_handles_resolution_failure():
+    with patch.object(forecast.socket, "getaddrinfo", side_effect=OSError):
+        assert forecast._system_ips(API_HOST) == set()
 
 
 def test_location_dataclass():
