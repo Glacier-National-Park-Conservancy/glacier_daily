@@ -33,13 +33,20 @@ BACKOFF_FACTOR = 0.2
 READ_RETRIES = 2  # Bound retries on read timeouts so a stalled API fails fast
 REQUEST_TIMEOUT = (5, 30)  # (connect, read) timeout in seconds
 API_HOST = urlsplit(BASE_URL).hostname or "api.open-meteo.com"
-# Open-Meteo's DNS answers with one server at a time, and different resolver
-# caches hold different answers. When the server our resolver gives us stalls,
-# ask Cloudflare's DNS-over-HTTPS (a few times, since its caches disagree) for
-# other servers and try those directly.
-DOH_URL = "https://cloudflare-dns.com/dns-query"
+# Open-Meteo's DNS answers with one server, picked by where the asker seems to
+# be. When the server our resolver gives us stalls, look the name up through
+# DNS-over-HTTPS as if from several regions (Google honours a client subnet
+# hint) to collect other servers, and try those directly. Cloudflare is a
+# backup in case Google can't be reached.
+GOOGLE_DOH_URL = "https://dns.google/resolve"
+CLOUDFLARE_DOH_URL = "https://cloudflare-dns.com/dns-query"
+DOH_QUERIES: list[tuple[str, str | None]] = [
+    (GOOGLE_DOH_URL, None),
+    (GOOGLE_DOH_URL, "24.0.0.0/16"),  # North America
+    (GOOGLE_DOH_URL, "81.0.0.0/16"),  # Europe
+    (CLOUDFLARE_DOH_URL, None),
+]
 DOH_TIMEOUT = (5, 10)
-DOH_LOOKUPS = 6
 MAX_FALLBACK_SERVERS = 2
 FEET_TO_METERS = 3.281
 TIME_FORMAT = "%-I:%M %p"
@@ -194,11 +201,18 @@ def _system_ips(host: str) -> set[str]:
     return {str(info[4][0]) for info in infos}
 
 
-def _doh_lookup(host: str) -> list[str]:
-    """Look up host's IPv4 addresses once through Cloudflare's DNS-over-HTTPS."""
+def _doh_lookup(host: str, url: str, client_subnet: str | None = None) -> list[str]:
+    """Look up host's IPv4 addresses through a JSON DNS-over-HTTPS endpoint.
+
+    client_subnet, if given, asks the resolver to answer as if the query came
+    from that network (Google's edns_client_subnet).
+    """
+    params = {"name": host, "type": "A"}
+    if client_subnet:
+        params["edns_client_subnet"] = client_subnet
     response = requests.get(
-        DOH_URL,
-        params={"name": host, "type": "A"},
+        url,
+        params=params,
         headers={"accept": "application/dns-json"},
         timeout=DOH_TIMEOUT,
     )
@@ -213,23 +227,22 @@ def _doh_lookup(host: str) -> list[str]:
 def _other_server_ips(host: str, exclude: set[str]) -> list[str]:
     """Find host's IPv4 addresses that aren't in exclude, via DNS-over-HTTPS.
 
-    Repeats the lookup up to DOH_LOOKUPS times and stops once one is found.
+    Runs every query in DOH_QUERIES and returns the addresses in the order they
+    were found, so nearer servers (from the earlier queries) come first.
 
     Raises:
         RequestException: If every lookup failed.
     """
     found: list[str] = []
     errors = []
-    for _ in range(DOH_LOOKUPS):
+    for url, client_subnet in DOH_QUERIES:
         try:
-            ips = _doh_lookup(host)
+            ips = _doh_lookup(host, url, client_subnet)
         except (RequestException, ValueError) as e:
             errors.append(str(e))
             continue
         found += [ip for ip in ips if ip not in exclude and ip not in found]
-        if found:
-            break
-    if errors and len(errors) == DOH_LOOKUPS:
+    if len(errors) == len(DOH_QUERIES):
         raise RequestException(f"DNS-over-HTTPS lookup failed: {errors[-1]}")
     return found
 
@@ -272,7 +285,7 @@ def _fetch_from_fallback_server(params: dict[str, Any]) -> Any:
     if not others:
         raise RequestException(
             f"No {API_HOST} servers found besides {sorted(tried)} "
-            f"in {DOH_LOOKUPS} DNS-over-HTTPS lookups"
+            f"in {len(DOH_QUERIES)} DNS-over-HTTPS lookups"
         )
 
     errors = []
