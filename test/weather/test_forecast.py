@@ -9,7 +9,7 @@ from requests.exceptions import RequestException
 from weather import forecast
 from weather.forecast import (
     API_HOST,
-    DOH_LOOKUPS,
+    DOH_QUERIES,
     READ_RETRIES,
     REQUEST_TIMEOUT,
     Location,
@@ -190,7 +190,9 @@ class TestFallbackServer:
         with (
             patch.object(forecast, "_system_ips", return_value={"1.1.1.1"}),
             patch.object(
-                forecast, "_doh_lookup", side_effect=[["1.1.1.1"], ["2.2.2.2"]]
+                forecast,
+                "_doh_lookup",
+                side_effect=[["1.1.1.1"], ["2.2.2.2"], ["3.3.3.3"], ["2.2.2.2"]],
             ) as lookup,
             patch.object(
                 forecast, "_fetch_from_ip", return_value=[MOCK_API_RESPONSE]
@@ -200,7 +202,48 @@ class TestFallbackServer:
 
         assert results == [("Test Location", 75, 36, "sunny")]
         assert "sunrise" in length_str
-        assert lookup.call_count == 2  # stops once another server turns up
+        assert lookup.call_count == len(DOH_QUERIES)
+        fetch.assert_called_once()
+        assert fetch.call_args.args[0] == "2.2.2.2"  # first one found
+
+    def test_tries_next_server_when_first_fails(
+        self, mock_session, mock_weather_codes_file
+    ):
+        mock_session.return_value.get.side_effect = RequestsConnectionError("stall")
+        with (
+            patch.object(forecast, "_system_ips", return_value={"1.1.1.1"}),
+            patch.object(
+                forecast,
+                "_doh_lookup",
+                side_effect=[["1.1.1.1"], ["2.2.2.2"], ["3.3.3.3"], []],
+            ),
+            patch.object(
+                forecast,
+                "_fetch_from_ip",
+                side_effect=[RequestException("down"), [MOCK_API_RESPONSE]],
+            ) as fetch,
+        ):
+            results, _ = get_forecast()
+
+        assert results == [("Test Location", 75, 36, "sunny")]
+        assert [c.args[0] for c in fetch.call_args_list] == ["2.2.2.2", "3.3.3.3"]
+
+    def test_one_failed_lookup_does_not_stop_the_others(
+        self, mock_session, mock_weather_codes_file
+    ):
+        mock_session.return_value.get.side_effect = RequestsConnectionError("stall")
+        with (
+            patch.object(forecast, "_system_ips", return_value={"1.1.1.1"}),
+            patch.object(
+                forecast,
+                "_doh_lookup",
+                side_effect=[RequestException("google down"), [], [], ["2.2.2.2"]],
+            ),
+            patch.object(
+                forecast, "_fetch_from_ip", return_value=[MOCK_API_RESPONSE]
+            ) as fetch,
+        ):
+            get_forecast()
         assert fetch.call_args.args[0] == "2.2.2.2"
 
     def test_raises_when_no_other_server_found(self, mock_session):
@@ -212,7 +255,7 @@ class TestFallbackServer:
             pytest.raises(RequestException, match=r"No api\.open-meteo\.com servers"),
         ):
             get_forecast()
-        assert lookup.call_count == DOH_LOOKUPS
+        assert lookup.call_count == len(DOH_QUERIES)
         fetch.assert_not_called()
 
     def test_raises_when_fallback_servers_fail(self, mock_session):
@@ -299,8 +342,26 @@ def test_doh_lookup_returns_a_records():
         ]
     }
     with patch.object(forecast.requests, "get", return_value=response) as get:
-        assert forecast._doh_lookup(API_HOST) == ["2.2.2.2"]
+        assert forecast._doh_lookup(API_HOST, "https://doh.example") == ["2.2.2.2"]
+    assert get.call_args.args[0] == "https://doh.example"
     assert get.call_args.kwargs["params"] == {"name": API_HOST, "type": "A"}
+
+
+def test_doh_lookup_sends_client_subnet():
+    response = Mock()
+    response.json.return_value = {}
+    with patch.object(forecast.requests, "get", return_value=response) as get:
+        assert (
+            forecast._doh_lookup(API_HOST, "https://doh.example", "24.0.0.0/16") == []
+        )
+    assert get.call_args.kwargs["params"]["edns_client_subnet"] == "24.0.0.0/16"
+
+
+def test_doh_queries_ask_from_several_regions():
+    """Region hints are what make Open-Meteo hand out its other servers."""
+    subnets = [subnet for _, subnet in DOH_QUERIES]
+    assert None in subnets
+    assert len({s for s in subnets if s}) >= 2
 
 
 def test_system_ips_handles_resolution_failure():
