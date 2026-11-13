@@ -1,6 +1,6 @@
 #!/home/pi/.local/bin/uv run python
 """
-Generate all of the data with a ThreadPoolExecutor, then upload it to the glacier.org
+Generate all of the data in parallel threads, then upload it to the glacier.org
 server with FTP.
 """
 
@@ -9,6 +9,8 @@ import concurrent.futures
 import json
 import os
 import sys
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from dataclasses import fields as dataclass_fields
@@ -48,7 +50,7 @@ from shared.logging_config import get_logger, setup_logging
 from shared.run_context import start_run
 from shared.run_report import complete_run
 from shared.settings import get_settings
-from shared.timing import timed
+from shared.timing import get_timing, timed
 from sunrise_timelapse.get_timelapse import process_video
 from sunset_timelapse.get_timelapse import process_sunset_video
 from trails_and_cgs.frontcountry_cgs import get_campground_status
@@ -172,6 +174,11 @@ _FIELD_DATACLASSES: dict[str, type] = {
 
 _CACHE_PURGE_PROPAGATION_SECS = 3
 
+# Wall-clock budget for collecting every module's data. A module still
+# running at the deadline is abandoned and falls back like a failure
+# (today's LKG, else its empty default).
+MODULE_TIMEOUT_SECS = 300
+
 
 def _is_substantive(value) -> bool:
     """Check if a value has meaningful content worth caching.
@@ -257,23 +264,55 @@ def _deserialize_field(key: str, value: Any) -> Any:
     return value
 
 
-def _submit_timed(executor, name, func, *args, **kwargs):
-    """Submit a function to the executor with timing instrumentation."""
+def _start_module(name, func, *args, **kwargs) -> concurrent.futures.Future:
+    """Run a module in a daemon thread, with timing, and return its Future.
 
-    @timed(name)
-    def wrapped():
-        return func(*args, **kwargs)
+    Daemon threads rather than a ThreadPoolExecutor so a module that
+    hangs past MODULE_TIMEOUT_SECS can be abandoned: an executor's
+    shutdown (and interpreter exit) joins its worker threads, so one
+    stuck request would hold the run — and the email — until it returned.
+    Python can't kill a thread; an abandoned daemon thread just stops
+    when the process exits. Modules only fetch data (uploads happen
+    later, in the main thread), so a late finish has no side effects.
+    """
+    future: concurrent.futures.Future = concurrent.futures.Future()
+    timed_func = timed(name)(func)
 
-    return executor.submit(wrapped)
+    def run() -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            result = timed_func(*args, **kwargs)
+        except BaseException as e:
+            future.set_exception(e)
+        else:
+            future.set_result(result)
+
+    threading.Thread(target=run, name=f"module-{name}", daemon=True).start()
+    return future
 
 
-def _safe_result(future, name, default, lkg_keys=None):
-    """Safely get a future's result, falling back to LKG then default."""
+def _safe_result(future, name, default, lkg_keys=None, deadline=None):
+    """Safely get a future's result, falling back to LKG then default.
+
+    ``deadline`` is a time.monotonic() value shared by every module in
+    the run, so the whole collection step is bounded by
+    MODULE_TIMEOUT_SECS rather than each wait getting a fresh budget.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + MODULE_TIMEOUT_SECS
     try:
-        return future.result(timeout=300)
+        return future.result(timeout=max(0.0, deadline - time.monotonic()))
     except Exception as e:
-        if isinstance(e, TimeoutError):
-            logger.error("Module '%s' timed out after 300s", name)
+        if not future.done():
+            # Abandon it: the run continues on LKG/defaults, and its
+            # timing entry stays an error even if it finishes later
+            logger.error("Module '%s' timed out after %ds", name, MODULE_TIMEOUT_SECS)
+            get_timing().abandon(
+                name,
+                MODULE_TIMEOUT_SECS,
+                f"timed out after {MODULE_TIMEOUT_SECS}s",
+            )
         else:
             logger.exception("Module '%s' failed: %s", name, e)
         if lkg_keys:
@@ -318,32 +357,33 @@ def gen_data() -> tuple[dict, list]:
             logger.info("Using cached data for '%s' (date-deterministic)", spec.name)
 
     fields: dict[str, Any] = {}
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = {}
-        module_globals = globals()
-        for spec in MODULES:
-            if spec.name in cached:
-                continue
-            # Re-resolved by name at submit time (not registry-build time)
-            # so tests can monkeypatch the module-level callables
-            func_name = getattr(spec.func, "__name__", "")
-            func = module_globals.get(func_name, spec.func)
-            kwargs = {"skip_upload": True} if spec.date_deterministic else {}
-            futures[spec.name] = _submit_timed(executor, spec.name, func, **kwargs)
+    futures = {}
+    module_globals = globals()
+    for spec in MODULES:
+        if spec.name in cached:
+            continue
+        # Re-resolved by name at submit time (not registry-build time)
+        # so tests can monkeypatch the module-level callables
+        func_name = getattr(spec.func, "__name__", "")
+        func = module_globals.get(func_name, spec.func)
+        kwargs = {"skip_upload": True} if spec.date_deterministic else {}
+        futures[spec.name] = _start_module(spec.name, func, **kwargs)
 
-        for spec in MODULES:
-            if spec.name in cached:
-                values = tuple(cached[spec.name].get(k, "") for k in spec.fields)
-            else:
-                lkg_keys = list(spec.fields) if spec.lkg_fallback else None
-                result = _safe_result(
-                    futures[spec.name],
-                    spec.name,
-                    spec.default_factory(),
-                    lkg_keys=lkg_keys,
-                )
-                values = result if len(spec.fields) > 1 else (result,)
-            fields.update(zip(spec.fields, values, strict=True))
+    deadline = time.monotonic() + MODULE_TIMEOUT_SECS
+    for spec in MODULES:
+        if spec.name in cached:
+            values = tuple(cached[spec.name].get(k, "") for k in spec.fields)
+        else:
+            lkg_keys = list(spec.fields) if spec.lkg_fallback else None
+            result = _safe_result(
+                futures[spec.name],
+                spec.name,
+                spec.default_factory(),
+                lkg_keys=lkg_keys,
+                deadline=deadline,
+            )
+            values = result if len(spec.fields) > 1 else (result,)
+        fields.update(zip(spec.fields, values, strict=True))
 
     weather = fields["weather"]
     fields["weather_image"] = (

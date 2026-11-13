@@ -150,7 +150,7 @@ uv run python -W ignore -m peak.peak
 
 ### Architecture Overview
 
-**Data Collection:** Uses `ThreadPoolExecutor` to gather data from multiple APIs concurrently.
+**Data Collection:** Runs each module in its own daemon thread to gather data from multiple APIs concurrently. Collection has a shared 5-minute deadline (`MODULE_TIMEOUT_SECS`): a module still running then is abandoned and falls back to today's LKG data or its empty default, so one hung request can't delay the email.
 
 **Entry Points:**
 - `main.py` - Full pipeline: data collection, FTP upload, email delivery

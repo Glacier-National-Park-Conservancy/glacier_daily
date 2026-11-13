@@ -1,8 +1,14 @@
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import generate_and_upload as gau
+import main
 from shared.data_types import (
     CampgroundsResult,
     EventsResult,
@@ -13,6 +19,8 @@ from shared.data_types import (
     WeatherResult,
 )
 from shared.lkg_cache import LKGCache
+from shared.timing import get_timing
+from sunset_timelapse.get_timelapse import TONIGHT_DESCRIPTOR
 
 
 def make_fake_weather():
@@ -910,3 +918,149 @@ class TestClearCache:
         assert cache.load("product", ["product_title"]) is None
         # Dynamic module LKG preserved
         assert cache.load("weather", ["weather"]) == {"weather": "data"}
+
+
+class TestModuleTimeout:
+    """A hung module is abandoned at the deadline instead of holding the run."""
+
+    TIMEOUT = 0.5
+
+    @pytest.fixture
+    def hang(self, monkeypatch):
+        """Yield a callable that blocks until the test ends, then release it."""
+        release = threading.Event()
+        monkeypatch.setattr(gau, "MODULE_TIMEOUT_SECS", self.TIMEOUT)
+
+        def hung(*args, **kwargs):
+            release.wait()
+            return TrailsResult(closures=["late result"])
+
+        yield hung
+        release.set()
+
+    def _setup_all_mocks(self, monkeypatch):
+        TestLKGFallback()._setup_all_mocks(monkeypatch)
+
+    def test_hung_module_falls_back_to_default(self, monkeypatch, hang):
+        self._setup_all_mocks(monkeypatch)
+        monkeypatch.setattr(gau, "get_closed_trails", hang)
+
+        start = time.monotonic()
+        result, _ = gau.gen_data()
+
+        assert time.monotonic() - start < self.TIMEOUT + 1
+        assert result["trails"] == TrailsResult()
+        assert get_timing().modules["trails"].status == "error"
+
+    def test_hung_module_uses_todays_lkg(self, monkeypatch, hang):
+        self._setup_all_mocks(monkeypatch)
+        gau.gen_data()  # Populate LKG
+        monkeypatch.setattr(gau, "get_closed_trails", hang)
+
+        result, _ = gau.gen_data()
+
+        assert result["trails"] == TrailsResult(closures=["trails"])
+
+    def test_late_finish_does_not_overwrite_timeout(self, monkeypatch):
+        self._setup_all_mocks(monkeypatch)
+        monkeypatch.setattr(gau, "MODULE_TIMEOUT_SECS", self.TIMEOUT)
+        release = threading.Event()
+        finished = threading.Event()
+
+        def hung():
+            release.wait()
+            finished.set()
+            return TrailsResult(closures=["late"])
+
+        monkeypatch.setattr(gau, "get_closed_trails", hung)
+        gau.gen_data()
+
+        release.set()
+        assert finished.wait(5)
+        time.sleep(0.1)  # let the timing wrapper record
+        assert get_timing().modules["trails"].status == "error"
+        assert "timed out" in get_timing().modules["trails"].error
+
+    def test_deadline_is_shared_across_modules(self, monkeypatch, hang):
+        """Three hung modules cost one timeout, not three."""
+        self._setup_all_mocks(monkeypatch)
+        for name in ("get_closed_trails", "get_road_status", "get_notices"):
+            monkeypatch.setattr(gau, name, hang)
+
+        start = time.monotonic()
+        gau.gen_data()
+
+        assert time.monotonic() - start < self.TIMEOUT * 2
+
+    def test_module_raising_timeout_error_is_a_failure(self, monkeypatch, caplog):
+        """A module's own TimeoutError (e.g. a socket timeout) is a normal failure."""
+        self._setup_all_mocks(monkeypatch)
+
+        def raises():
+            raise TimeoutError("read timed out")
+
+        monkeypatch.setattr(gau, "get_closed_trails", raises)
+        result, _ = gau.gen_data()
+
+        assert result["trails"] == TrailsResult()
+        assert "Module 'trails' failed" in caplog.text
+        assert "timed out after" not in caplog.text
+
+    def test_hung_module_does_not_block_process_exit(self):
+        code = (
+            "import threading, generate_and_upload as g\n"
+            "g._start_module('stuck', threading.Event().wait)\n"
+            "print('done')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(gau.__file__).parent,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "done" in proc.stdout
+
+
+class TestSunsetModuleTimeout:
+    """A hung sunset module never lets the sunset email go out without tonight's video."""
+
+    @pytest.fixture(autouse=True)
+    def _hung_sunset(self, monkeypatch):
+        TestLKGFallback()._setup_all_mocks(monkeypatch)
+        monkeypatch.setattr(gau, "MODULE_TIMEOUT_SECS", 0.5)
+        self.release = threading.Event()
+        self.monkeypatch = monkeypatch
+        yield
+        self.release.set()
+
+    def _seed_sunset_lkg(self, descriptor):
+        self.monkeypatch.setattr(
+            gau, "process_sunset_video", lambda: ("sv", "ss", descriptor)
+        )
+        gau.gen_data()
+
+    def _hang_sunset(self):
+        self.monkeypatch.setattr(
+            gau, "process_sunset_video", lambda: self.release.wait()
+        )
+
+    def test_no_lkg_blocks_send(self):
+        self._hang_sunset()
+        result, _ = gau.gen_data()
+        assert not main.sunset_content_ok(result)
+
+    def test_stale_latest_lkg_blocks_send(self):
+        self._seed_sunset_lkg("Latest")
+        self._hang_sunset()
+        result, _ = gau.gen_data()
+        assert result["sunset_str"] == "Latest"
+        assert not main.sunset_content_ok(result)
+
+    def test_tonights_lkg_from_today_still_sends(self):
+        """Today's cached copy of tonight's video is valid data."""
+        self._seed_sunset_lkg(TONIGHT_DESCRIPTOR)
+        self._hang_sunset()
+        result, _ = gau.gen_data()
+        assert main.sunset_content_ok(result)

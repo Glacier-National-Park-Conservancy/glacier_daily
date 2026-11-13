@@ -198,6 +198,18 @@ class TestRunTiming:
         timing = RunTiming()
         assert timing.summary() == {}
 
+    def test_abandon_records_error_and_ignores_late_result(self):
+        timing = RunTiming()
+        timing.abandon("weather", 300, "timed out after 300s")
+        timing.record(
+            ModuleResult(name="weather", status="success", duration_seconds=2923.4)
+        )
+
+        summary = timing.summary()
+        assert summary["weather"]["status"] == "error"
+        assert summary["weather"]["error"] == "timed out after 300s"
+        assert summary["weather"]["duration_seconds"] == 300
+
 
 class TestGetTiming:
     def test_get_timing_creates_singleton(self):

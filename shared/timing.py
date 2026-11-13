@@ -53,10 +53,26 @@ class RunTiming:
 
     modules: dict[str, ModuleResult] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _abandoned: set[str] = field(default_factory=set, repr=False)
 
     def record(self, result: ModuleResult) -> None:
         with self._lock:
+            # An abandoned module's thread may still finish later; keep
+            # the timeout error rather than letting a late success hide it
+            if result.name in self._abandoned:
+                return
             self.modules[result.name] = result
+
+    def abandon(self, name: str, duration_seconds: float, error: str) -> None:
+        """Record a module as timed out and ignore any later result for it."""
+        with self._lock:
+            self._abandoned.add(name)
+            self.modules[name] = ModuleResult(
+                name=name,
+                status="error",
+                duration_seconds=duration_seconds,
+                error=error,
+            )
 
     def summary(self) -> dict[str, dict]:
         with self._lock:
