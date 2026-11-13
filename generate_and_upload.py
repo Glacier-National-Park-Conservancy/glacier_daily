@@ -279,8 +279,8 @@ def _start_module(name, func, *args, **kwargs) -> concurrent.futures.Future:
     timed_func = timed(name)(func)
 
     def run() -> None:
-        if not future.set_running_or_notify_cancel():
-            return
+        # Nothing cancels these futures, so this always marks it running
+        future.set_running_or_notify_cancel()
         try:
             result = timed_func(*args, **kwargs)
         except BaseException as e:
@@ -292,15 +292,13 @@ def _start_module(name, func, *args, **kwargs) -> concurrent.futures.Future:
     return future
 
 
-def _safe_result(future, name, default, lkg_keys=None, deadline=None):
+def _safe_result(future, name, default, *, deadline, lkg_keys=None):
     """Safely get a future's result, falling back to LKG then default.
 
     ``deadline`` is a time.monotonic() value shared by every module in
     the run, so the whole collection step is bounded by
     MODULE_TIMEOUT_SECS rather than each wait getting a fresh budget.
     """
-    if deadline is None:
-        deadline = time.monotonic() + MODULE_TIMEOUT_SECS
     try:
         return future.result(timeout=max(0.0, deadline - time.monotonic()))
     except Exception as e:
