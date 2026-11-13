@@ -4,7 +4,13 @@ from unittest.mock import Mock, mock_open, patch
 import pytest
 from requests.exceptions import RequestException
 
-from weather.forecast import Location, WeatherAPI, get_forecast
+from weather.forecast import (
+    READ_RETRIES,
+    REQUEST_TIMEOUT,
+    Location,
+    WeatherAPI,
+    get_forecast,
+)
 
 # Test data
 SAMPLE_LOCATION = Location(
@@ -49,6 +55,12 @@ class TestWeatherAPI:
         assert isinstance(api.locations, list)
         assert all(isinstance(loc, Location) for loc in api.locations)
         assert len(api.locations) > 0
+
+    def test_session_bounds_read_retries(self):
+        """Test the retry strategy limits retries on read timeouts."""
+        session = WeatherAPI._setup_session()
+        retries = session.get_adapter("https://api.open-meteo.com").max_retries
+        assert retries.read == READ_RETRIES
 
     def test_load_locations(self):
         """Test loading of location data."""
@@ -123,6 +135,20 @@ class TestGetForecast:
         assert all(isinstance(item, tuple) for item in results)
         assert "sunrise" in length_str
         assert "sunset" in length_str
+
+    def test_request_uses_timeout(self, mock_session, mock_weather_codes_file):
+        """Test the API request sets a timeout so a stalled server can't hang."""
+        mock_response = Mock()
+        mock_response.json.return_value = [MOCK_API_RESPONSE]
+        mock_session.return_value.get.return_value = mock_response
+
+        with patch.object(
+            WeatherAPI, "_load_locations", return_value=[SAMPLE_LOCATION]
+        ):
+            get_forecast()
+        assert mock_session.return_value.get.call_args.kwargs["timeout"] == (
+            REQUEST_TIMEOUT
+        )
 
     def test_api_error(self, mock_session):
         """Test API error handling."""

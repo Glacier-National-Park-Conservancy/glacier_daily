@@ -21,6 +21,8 @@ BASE_URL = "https://api.open-meteo.com/v1/forecast"
 CACHE_DURATION = 3600  # Cache duration in seconds
 RETRY_ATTEMPTS = 5
 BACKOFF_FACTOR = 0.2
+READ_RETRIES = 2  # Bound retries on read timeouts so a stalled API fails fast
+REQUEST_TIMEOUT = (5, 30)  # (connect, read) timeout in seconds
 FEET_TO_METERS = 3.281
 TIME_FORMAT = "%-I:%M %p"
 
@@ -49,7 +51,9 @@ class WeatherAPI:
         cache_session = requests_cache.CachedSession(
             ".cache", expire_after=CACHE_DURATION
         )
-        retry_strategy = Retry(total=RETRY_ATTEMPTS, backoff_factor=BACKOFF_FACTOR)
+        retry_strategy = Retry(
+            total=RETRY_ATTEMPTS, read=READ_RETRIES, backoff_factor=BACKOFF_FACTOR
+        )
         retry_adapter = HTTPAdapter(max_retries=retry_strategy)
 
         cache_session.mount("http://", retry_adapter)
@@ -180,7 +184,9 @@ def get_forecast() -> tuple[list[tuple[str, int, int, str]], str]:
     api = WeatherAPI()
 
     try:
-        response = api.session.get(BASE_URL, params=api._build_params())
+        response = api.session.get(
+            BASE_URL, params=api._build_params(), timeout=REQUEST_TIMEOUT
+        )
         response.raise_for_status()
         forecasts = response.json()
 
